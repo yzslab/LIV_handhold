@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <chrono>
 #include <ros/ros.h>
+#include <rosbag/bag.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -13,6 +14,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 using namespace std;
 
@@ -27,20 +31,56 @@ enum PixelFormat : unsigned int {
   BayerRG8 = 0x01080009,
   BayerRG12Packed = 0x010C002B,
   BayerGB12Packed = 0x010C002C,
-  BayerGB8 = 0x0108000A
+  BayerGB8 = 0x0108000A,
+  BayerBG8 = 0x0108000B
 };
 // unsigned int g_nPayloadSize = 0;
 bool is_undistorted = true;
-bool exit_flag = false;
+std::atomic<bool> exit_flag{false};
 int width, height;
 image_transport::Publisher pub;
-std::vector<PixelFormat> PIXEL_FORMAT = { RGB8, BayerRG8, BayerRG12Packed, BayerGB12Packed, BayerGB8 };
+std::vector<PixelFormat> PIXEL_FORMAT = { RGB8, BayerRG8, BayerRG12Packed, BayerGB12Packed, BayerGB8, BayerBG8 };
+/*
+HiK -> OpenCV -> ConversionCode:
+  BG -> BGGR = RG -> 
+  GB -> GBRG = GR
+  GR -> GRBG = GB
+  RG -> RGGB = BG
+*/
+std::vector<cv::ColorConversionCodes> CV_COLOR_CONVERSION_CODE = { 
+  static_cast<cv::ColorConversionCodes>(65535), // RGB
+  cv::COLOR_BayerBG2RGB, // RG8
+  static_cast<cv::ColorConversionCodes>(65535), // RG12Packed
+  static_cast<cv::ColorConversionCodes>(65535), // GB12Packed
+  cv::COLOR_BayerGR2RGB, // GB8
+  cv::COLOR_BayerRG2RGB // BG8
+};
 std::string ExposureAutoStr[3] = {"Off", "Once", "Continues"};
 std::string GammaSlectorStr[3] = {"User", "sRGB", "Off"};
 std::string GainAutoStr[3] = {"Off", "Once", "Continues"};
 float image_scale = 0.0;
 int trigger_enable = 1;
 
+cv::ColorConversionCodes cv_color_conversion_code;
+
+bool bag_enabled = true;
+struct ImageData {
+  cv::Mat image;
+  uint32_t seq;
+  ros::Time rcv_time;
+  ros::Time pub_time;
+};
+using ImageDataPtr = std::unique_ptr<ImageData>;
+std::queue<ImageDataPtr> image_queue;
+std::mutex image_queue_mtx;
+std::condition_variable image_queue_cv;
+
+struct BagThreadParams {
+  std::string pub_topic;
+  std::string bag_file_path;
+  std::string thread_name;
+  std::string timestamp;
+};
 
 bool PrintDeviceInfo(MV_CC_DEVICE_INFO* pstMVDevInfo)
 {
@@ -191,6 +231,51 @@ void SetupSignalHandler() {
   sigaction(SIGINT, &sigIntHandler, NULL);
 }
 
+static void *BagWriterThread(void *args) {
+  std::unique_ptr<BagThreadParams> param_ptr(static_cast<BagThreadParams *>(args));
+
+  auto bag_file_path = param_ptr->bag_file_path + "_" + param_ptr->thread_name + "_" + param_ptr->timestamp + ".bag";
+  std::cout << "bag_file_path=" << bag_file_path << std::endl;
+
+  rosbag::Bag bag;
+  bag.open(bag_file_path, rosbag::bagmode::Write);
+
+  auto topic = param_ptr->pub_topic + "/compressed";
+  if (topic[0] != '/') {
+    topic = "/" + topic;
+  }
+
+  // size_t image_queue_size = 0;
+
+  for (;;) {
+    ImageDataPtr image_data_ptr;
+    {
+      std::unique_lock<std::mutex> lk(image_queue_mtx);
+      image_queue_cv.wait(lk, []{ return !image_queue.empty() || exit_flag; });
+
+      if (image_queue.empty() && exit_flag) {
+        break;
+      }
+
+      image_data_ptr = std::move(image_queue.front());
+      image_queue.pop();
+
+      // image_queue_size = image_queue.size();
+    }
+
+    sensor_msgs::CompressedImagePtr msg_origin = cv_bridge::CvImage(std_msgs::Header(), "rgb8", image_data_ptr->image).toCompressedImageMsg(cv_bridge::JPEG);
+    msg_origin->header.seq = image_data_ptr->seq;
+    msg_origin->header.stamp = image_data_ptr->rcv_time;
+    bag.write(topic, image_data_ptr->pub_time, msg_origin);
+
+    // std::cout << "Compressed 1 image, image_queue.size()=" << image_queue_size << std::endl;
+  }
+
+  // std::cout << "BagWriterThread exited" << std::endl;
+
+  return nullptr;
+}
+
 static void *WorkThread(void *pUser) {
   int nRet = MV_OK;
 
@@ -215,10 +300,17 @@ static void *WorkThread(void *pUser) {
     return nullptr;
   }
 
-  while (!exit_flag && ros::ok()) {
+  int n_images = 0;
+  auto started_at = ros::Time::now();
 
+  uint32_t image_seq = 0;
+  size_t image_queue_size = 0;
+
+  while (!exit_flag && ros::ok()) {
     nRet = MV_CC_GetOneFrameTimeout(pUser, pData, stParam.nCurValue * 3, &stImageInfo, 1000);
     if (nRet == MV_OK) {
+
+      n_images += 1;
       
       ros::Time rcv_time;
       if(trigger_enable && pointt != MAP_FAILED && pointt->low != 0)
@@ -239,33 +331,66 @@ static void *WorkThread(void *pUser) {
       //             std::to_string(rcv_time.toSec());
       // ROS_INFO_STREAM(debug_msg.c_str());
 
-      stConvertParam.nWidth = stImageInfo.nWidth;
-      stConvertParam.nHeight = stImageInfo.nHeight;
-      stConvertParam.pSrcData = pData;
-      stConvertParam.nSrcDataLen = stParam.nCurValue * 3; 
-      stConvertParam.enSrcPixelType = stImageInfo.enPixelType;
-      stConvertParam.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
-      stConvertParam.pDstBuffer = pDataForBGR;
-      stConvertParam.nDstBufferSize = stParam.nCurValue * 3;
-      nRet = MV_CC_ConvertPixelType(pUser, &stConvertParam);
-      if (MV_OK != nRet)
-      {
-        printf("MV_CC_ConvertPixelType failed! nRet [%x], skipping this frame\n", nRet);
-        continue;
-      }
-      cv::Mat srcImage;
-      srcImage = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, pDataForBGR);
+      // stConvertParam.nWidth = stImageInfo.nWidth;
+      // stConvertParam.nHeight = stImageInfo.nHeight;
+      // stConvertParam.pSrcData = pData;
+      // stConvertParam.nSrcDataLen = stParam.nCurValue * 3; 
+      // stConvertParam.enSrcPixelType = stImageInfo.enPixelType;
+      // stConvertParam.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
+      // stConvertParam.pDstBuffer = pDataForBGR;
+      // stConvertParam.nDstBufferSize = stParam.nCurValue * 3;
+      // nRet = MV_CC_ConvertPixelType(pUser, &stConvertParam);
+      // if (MV_OK != nRet)
+      // {
+      //   printf("MV_CC_ConvertPixelType failed! nRet [%x], skipping this frame\n", nRet);
+      //   continue;
+      // }
 
-      // cv::Mat srcImage;
-      // srcImage = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, pData);
+      cv::Mat originImage;
+      if (stImageInfo.enPixelType == PixelType_Gvsp_RGB8_Packed) {
+        originImage = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, pData).clone();
+      } else {
+        cv::Mat bayerImage;
+        bayerImage = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC1, pData);
+
+        cv::demosaicing(bayerImage, originImage, cv_color_conversion_code, 0);
+      }
+
+      if (bag_enabled) {
+      {
+          ImageDataPtr image_data_ptr = std::make_unique<ImageData>(ImageData{
+            originImage,
+            image_seq++,
+            rcv_time,
+            ros::Time::now()
+          });
+
+          std::lock_guard<std::mutex> lk(image_queue_mtx);
+          image_queue.push(std::move(image_data_ptr));
+
+          image_queue_size = image_queue.size();
+        }
+        image_queue_cv.notify_one();
+      }
+
+      cv::Mat resizedImage;
       if (image_scale > 0.0) {
-        cv::resize(srcImage, srcImage, cv::Size(srcImage.cols * image_scale, srcImage.rows * image_scale), cv::INTER_LINEAR);
+        cv::resize(originImage, resizedImage, cv::Size(originImage.cols * image_scale, originImage.rows * image_scale), cv::INTER_LINEAR);
       } else {
         printf("Invalid image_scale: %f. Skipping resize.\n", image_scale);
       }
-      sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "rgb8", srcImage).toImageMsg();
+
+      sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "rgb8", resizedImage).toImageMsg();
       msg->header.stamp = rcv_time;
       pub.publish(msg);
+
+      if (n_images > 50) {
+        auto time_comsuption = ros::Time::now() - started_at;
+        printf("FPS: %f, image_queue.size()=%ld\n", n_images / time_comsuption.toSec(), image_queue_size);
+        
+        n_images = 0;
+        started_at = ros::Time::now();
+      }
     }
   }
 
@@ -288,6 +413,12 @@ int main(int argc, char **argv) {
   ros::init(argc, argv, "mvs_trigger");
   std::string params_file = std::string(argv[1]);
   ros::NodeHandle nh;
+
+  std::string node_name = ros::this_node::getName();
+  std::string bag_file_path;
+  nh.getParam("/" + node_name + "/bag", bag_file_path);
+  std::cout << "bag_file_path=" << bag_file_path << std::endl;
+
   image_transport::ImageTransport it(nh);
   int nRet = MV_OK;
   void *handle = NULL;
@@ -435,6 +566,12 @@ int main(int argc, char **argv) {
   // }
   // g_nPayloadSize = stParam.nCurValue * 3;
 
+  cv_color_conversion_code = CV_COLOR_CONVERSION_CODE[PixelFormat];
+  if (PixelFormat != 0 && static_cast<int32_t>(cv_color_conversion_code) == 65535) {
+    printf("Only Bayer 8 is supported.");
+    return -1;
+  }
+
   nRet = MV_CC_SetEnumValue(handle, "PixelFormat", PIXEL_FORMAT[PixelFormat]); // BayerRG8 0x01080009 RGB8 0x02180014 BayerRG12Packed 0x010C002B
   if (nRet != MV_OK) {
     printf("Pixel setting can't work.");
@@ -464,6 +601,41 @@ int main(int argc, char **argv) {
     return -1;
   }
 
+  const uint32_t n_bag_threads = 2;
+  std::vector<pthread_t> bag_threads;
+  bag_enabled = bag_file_path.length() > 0;
+  std::string bag_timestamp = std::to_string(static_cast<int>(ros::Time::now().toSec()));
+
+  if (bag_enabled) {
+    if (bag_file_path.length() >= 4 && bag_file_path.substr(bag_file_path.length() - 4, 4) == ".bag") {
+      bag_file_path = bag_file_path.substr(0, bag_file_path.length() - 4);
+      std::cout << "basic_bag_file_path=" << bag_file_path << std::endl;
+    }
+
+    if (bag_file_path[0] == '~') {
+      bag_file_path = getenv("HOME") + bag_file_path.substr(1);
+    }
+
+    for (int i = 0; i < n_bag_threads; ++i) {
+      std::ostringstream oss;
+      oss << std::setw(2) << std::setfill('0') << i + 1;
+
+      pthread_t bagThreadID;
+      nRet = pthread_create(&bagThreadID, NULL, BagWriterThread, static_cast<void *>(new BagThreadParams{
+        pub_topic,
+        bag_file_path,
+        oss.str(),
+        bag_timestamp,
+      }));
+      if (nRet != 0) {
+        printf("bag thread create failed.ret = %d\n", nRet);
+        exit(-1);
+      }
+
+      bag_threads.push_back(bagThreadID);
+    }
+  }
+
   pthread_t nThreadID;
   nRet = pthread_create(&nThreadID, NULL, WorkThread, handle);
   if (nRet != 0) {
@@ -479,6 +651,14 @@ int main(int argc, char **argv) {
   if (nThreadID) {
     pthread_join(nThreadID, NULL);
     ROS_INFO_STREAM("Worker thread joined.");
+  }
+
+  if (bag_threads.size() > 0) {
+    for (const pthread_t &i : bag_threads) {
+      image_queue_cv.notify_all();
+      pthread_join(i, NULL);
+      ROS_INFO_STREAM("Bag thread joined.");
+    }
   }
 
   nRet = MV_CC_StopGrabbing(handle);
